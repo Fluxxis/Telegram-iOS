@@ -1,0 +1,112 @@
+name: build Swiftgram (unsigned ipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "bazel configuration"
+        required: false
+        default: "release_arm64"
+
+concurrency:
+  group: swiftgram-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: false
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          WANTED="$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')"
+          echo "versions.json wants Xcode $WANTED"
+          # Runner image tops out below that, so take the newest installed.
+          NEWEST="$(ls -1d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "using $NEWEST"
+          sudo xcode-select -s "$NEWEST/Contents/Developer"
+          xcodebuild -version
+
+      - name: Environment report
+        run: |
+          set -euo pipefail
+          sw_vers
+          echo "cpus   : $(sysctl -n hw.ncpu)"
+          echo "memory : $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GB"
+          df -h /
+          python3 --version
+          bazel --version || true
+
+      - name: Canonical source dir
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users/Shared
+          sudo cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+          sudo chown -R "$(id -u):$(id -g)" /Users/Shared/telegram-ios
+
+      - name: Import fake signing certificates
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          set -euo pipefail
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
+      - name: Build
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          set -euo pipefail
+          export BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+
+          APP_VERSION="$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')"
+          OFFSET="$(cat build_number_offset)"
+          BUILD_NUMBER="$(( $(git rev-list --count HEAD) + OFFSET ))"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
+            --overrideBazelVersion \
+            --bazelArguments="--local_ram_resources=4096" \
+            build \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration="${{ inputs.configuration }}" \
+            --buildNumber="$BUILD_NUMBER"
+
+      - name: Collect artifacts
+        if: always()
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          set -uo pipefail
+          mkdir -p build/artifacts
+          shopt -s nullglob
+          found=0
+          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            cp "$f" build/artifacts/ && found=1
+          done
+          if [ "$found" = 0 ]; then
+            echo "no Telegram.ipa produced"
+            ls -1 bazel-out 2>/dev/null | head -20 || true
+          else
+            ls -lh build/artifacts
+          fi
+          df -h /
+
+      - name: Upload ipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-ipa
+          path: /Users/Shared/telegram-ios/build/artifacts/
+          if-no-files-found: warn
+          retention-days: 7
